@@ -5,6 +5,8 @@ import json
 import urllib.parse
 import urllib.request
 import urllib.error
+import os
+import psycopg
 
 from flask import Flask, request, redirect, session, jsonify
 
