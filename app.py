@@ -2,17 +2,18 @@
 import os
 import secrets
 import json
+import logging
 import urllib.parse
 import urllib.request
 import urllib.error
 
-import psycopg
+from datetime import datetime, timedelta, timezone
 
+import psycopg
+from psycopg.rows import dict_row
 from flask import Flask, request, redirect, session, jsonify
 
 app = Flask(__name__)
-
-# Configuracao da sessao
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "")
 
 app.config.update(
@@ -21,31 +22,90 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
 )
 
-# Credenciais do Mercado Livre
+logging.basicConfig(level=logging.INFO)
+
 CLIENT_ID = os.environ.get("MERCADOLIVRE_CLIENT_ID", "").strip()
 CLIENT_SECRET = os.environ.get("MERCADOLIVRE_CLIENT_SECRET", "").strip()
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 REDIRECT_URI = (
     "https://bruno-central-oauth-2026.onrender.com/oauth/callback"
 )
-
 AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
+
+
+def database_connection():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL nao configurada")
+    return psycopg.connect(DATABASE_URL, connect_timeout=10)
+
+
+def create_tokens_table():
+    """Cria a tabela se ainda nao existir."""
+    with database_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mercadolivre_tokens (
+                    user_id BIGINT PRIMARY KEY,
+                    access_token TEXT NOT NULL,
+                    refresh_token TEXT,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+
+
+def save_tokens(token_data):
+    """Insere ou atualiza os tokens da conta autorizada."""
+    user_id = token_data.get("user_id")
+    access_token = token_data.get("access_token")
+    refresh_token = token_data.get("refresh_token")
+    expires_in = token_data.get("expires_in")
+
+    if not user_id or not access_token or not expires_in:
+        raise ValueError("Resposta OAuth incompleta")
+
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        seconds=int(expires_in)
+    )
+
+    create_tokens_table()
+
+    with database_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO mercadolivre_tokens (
+                    user_id,
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    access_token = EXCLUDED.access_token,
+                    refresh_token = EXCLUDED.refresh_token,
+                    expires_at = EXCLUDED.expires_at,
+                    updated_at = NOW()
+            """, (
+                int(user_id),
+                access_token,
+                refresh_token,
+                expires_at,
+            ))
 
 
 @app.get("/")
 def home():
     if not app.secret_key:
-        return (
-            "Erro: FLASK_SECRET_KEY nao configurada no Render.",
-            500,
-        )
+        return "FLASK_SECRET_KEY nao configurada no Render.", 500
 
     if not CLIENT_ID or not CLIENT_SECRET:
-        return (
-            "Erro: confira as variaveis de ambiente do Mercado Livre.",
-            500,
-        )
+        return "Confira as credenciais do Mercado Livre no Render.", 500
 
     return """
     <!doctype html>
@@ -74,7 +134,7 @@ def oauth_login():
     if not app.secret_key or not CLIENT_ID or not CLIENT_SECRET:
         return jsonify({
             "status": "erro",
-            "mensagem": "Confira as variaveis de ambiente no Render.",
+            "mensagem": "Confira as variaveis de ambiente do Render.",
         }), 500
 
     state = secrets.token_urlsafe(32)
@@ -87,11 +147,8 @@ def oauth_login():
         "state": state,
     }
 
-    authorization_url = (
-        AUTH_URL + "?" + urllib.parse.urlencode(params)
-    )
-
-    response = redirect(authorization_url)
+    url = AUTH_URL + "?" + urllib.parse.urlencode(params)
+    response = redirect(url)
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -114,8 +171,7 @@ def oauth_callback():
         return jsonify({
             "status": "erro",
             "mensagem": (
-                "Codigo de autorizacao nao recebido. "
-                "Inicie a conexao pela pagina inicial."
+                "Codigo nao recebido. Inicie a conexao pela pagina inicial."
             ),
         }), 400
 
@@ -125,20 +181,16 @@ def oauth_callback():
         return jsonify({
             "status": "erro_validacao_state",
             "mensagem": (
-                "Sessao OAuth nao encontrada. "
-                "Volte a pagina inicial e tente novamente."
+                "Sessao OAuth nao encontrada. Inicie uma nova conexao."
             ),
-            "diagnostico": "state_ausente_ou_sessao_perdida",
         }), 400
 
     if not secrets.compare_digest(expected_state, received_state):
         return jsonify({
             "status": "erro_validacao_state",
             "mensagem": (
-                "A validacao de seguranca falhou. "
-                "Inicie uma nova conexao."
+                "Validacao de seguranca falhou. Inicie uma nova conexao."
             ),
-            "diagnostico": "state_diferente_do_esperado",
         }), 400
 
     payload = {
@@ -149,11 +201,9 @@ def oauth_callback():
         "redirect_uri": REDIRECT_URI,
     }
 
-    data = urllib.parse.urlencode(payload).encode("utf-8")
-
     req = urllib.request.Request(
         TOKEN_URL,
-        data=data,
+        data=urllib.parse.urlencode(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
@@ -163,9 +213,7 @@ def oauth_callback():
 
     try:
         with urllib.request.urlopen(req, timeout=30) as result:
-            token_response = json.loads(
-                result.read().decode("utf-8")
-            )
+            token_data = json.loads(result.read().decode("utf-8"))
 
     except urllib.error.HTTPError as exc:
         try:
@@ -173,7 +221,7 @@ def oauth_callback():
         except (ValueError, UnicodeDecodeError):
             body = {}
 
-        response = jsonify({
+        return jsonify({
             "status": "erro_na_troca_do_token",
             "http_status": exc.code,
             "erro": body.get("error", "erro_http"),
@@ -181,90 +229,44 @@ def oauth_callback():
                 "error_description",
                 "O Mercado Livre recusou a troca do codigo pelo token.",
             ),
-            "orientacao": (
-                "Confira as credenciais, o Redirect URI e se o codigo "
-                "de autorizacao e novo."
-            ),
-        })
-        response.status_code = 400
-        response.headers["Cache-Control"] = "no-store"
-        return response
+        }), 400
 
     except (urllib.error.URLError, TimeoutError):
         return jsonify({
             "status": "erro_de_conexao",
-            "mensagem": "Falha de conexao com a API do Mercado Livre.",
+            "mensagem": "Falha de conexao com o Mercado Livre.",
         }), 502
 
     except (ValueError, UnicodeDecodeError):
         return jsonify({
             "status": "erro",
-            "mensagem": "Resposta da API nao pode ser interpretada.",
+            "mensagem": "Resposta invalida da API do Mercado Livre.",
         }), 502
 
-    if not token_response.get("access_token"):
+    try:
+        save_tokens(token_data)
+    except Exception:
+        app.logger.exception("Falha ao salvar tokens no PostgreSQL")
         return jsonify({
-            "status": "erro",
-            "mensagem": "A API nao retornou um access token.",
-        }), 502
+            "status": "erro_ao_salvar_tokens",
+            "mensagem": (
+                "A autorizacao foi recebida, mas nao foi possivel "
+                "salvar os tokens. Consulte os logs do Render."
+            ),
+        }), 500
 
     response = jsonify({
         "status": "conectado",
         "mensagem": (
-            "Autorizacao concluida. Os tokens ainda nao foram salvos."
+            "Autorizacao concluida e tokens armazenados no PostgreSQL."
         ),
-        "usuario_id": token_response.get("user_id"),
-        "expira_em_segundos": token_response.get("expires_in"),
-        "proxima_etapa": (
-            "Configurar armazenamento seguro e renovacao dos tokens."
-        ),
+        "usuario_id": token_data.get("user_id"),
+        "expira_em_segundos": token_data.get("expires_in"),
+        "tokens_exibidos": False,
+        "proxima_etapa": "Validar armazenamento e preparar renovacao.",
     })
     response.headers["Cache-Control"] = "no-store"
     return response
-
-
-# ROTA TEMPORARIA: teste da conexao com PostgreSQL
-@app.get("/diagnostico-db")
-def diagnostico_db():
-    database_url = os.environ.get("DATABASE_URL")
-
-    if not database_url:
-        return jsonify({
-            "status": "erro",
-            "mensagem": "DATABASE_URL nao configurada no Render.",
-        }), 500
-
-    try:
-        with psycopg.connect(
-            database_url,
-            connect_timeout=5,
-        ) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                resultado = cur.fetchone()[0]
-
-        if resultado == 1:
-            return jsonify({
-                "status": "sucesso",
-                "mensagem": "Conexao com PostgreSQL funcionando.",
-            }), 200
-
-        return jsonify({
-            "status": "erro",
-            "mensagem": "O banco respondeu com um resultado inesperado.",
-        }), 500
-
-    except Exception:
-        app.logger.exception(
-            "Falha no teste de conexao com PostgreSQL"
-        )
-        return jsonify({
-            "status": "erro",
-            "mensagem": (
-                "Nao foi possivel conectar ao banco. "
-                "Consulte os logs do Render."
-            ),
-        }), 500
 
 
 if __name__ == "__main__":
